@@ -1,0 +1,8 @@
+#!/bin/sh
+set -eu
+: "${PICORUBY:?PICORUBY must be the path to the PicoRuby VM binary}"
+ROOT=$(cd "$(dirname "$0")/.." && pwd)
+cd "$ROOT"
+set -- mrbgems/picorake/mrblib/*.rb
+trap '' PIPE
+exec "$PICORUBY" test/runner.rb "$ROOT" test "$@"
