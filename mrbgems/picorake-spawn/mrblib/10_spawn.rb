@@ -2,20 +2,45 @@ module Picorake
   module Spawn
     ERR_MODES = { merge: 0, null: 1, inherit: 2 }
 
+    class FeedError < Error
+      def initialize(index, status)
+        @index = index
+        @status = status
+        super("feeder #{index} exited #{status}")
+      end
+
+      def index
+        @index
+      end
+
+      def status
+        @status
+      end
+    end
+
     def self._err_mode(err)
       mode = ERR_MODES[err]
       raise ArgumentError, "err must be :merge, :null or :inherit" unless mode
       mode
     end
 
-    def self.run(argv, stdin: nil, err: :merge, out: :capture)
+    def self._run_exec(argvs, stdin, stdin_from, mode, capture)
+      return _exec(argvs, stdin, mode, capture) if stdin_from.nil?
+      output, statuses, failure = _exec_feed(argvs, stdin_from, mode, capture)
+      raise FeedError.new(failure[0], failure[1]) if failure
+      [output, statuses]
+    end
+
+    def self.run(argv, stdin: nil, stdin_from: nil, err: :merge, out: :capture)
+      raise ArgumentError, "stdin and stdin_from are mutually exclusive" if !stdin.nil? && !stdin_from.nil?
+      raise ArgumentError, "stdin_from must be an Array of pipelines" unless stdin_from.nil? || stdin_from.is_a?(Array)
       mode = _err_mode(err)
       case out
       when :capture
-        output, statuses = _exec([argv], stdin, mode, 1)
+        output, statuses = _run_exec([argv], stdin, stdin_from, mode, 1)
         [output, statuses[0]]
       when :inherit
-        _output, statuses = _exec([argv], stdin, mode, 0)
+        _output, statuses = _run_exec([argv], stdin, stdin_from, mode, 0)
         statuses[0]
       else
         raise ArgumentError, "out must be :capture or :inherit"

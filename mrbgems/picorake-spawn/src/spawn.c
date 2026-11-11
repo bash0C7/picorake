@@ -43,6 +43,40 @@ typedef struct {
 } job_t;
 
 static void
+wipe(void *p, size_t n)
+{
+  volatile unsigned char *v = (volatile unsigned char *)p;
+  while (n-- > 0) *v++ = 0;
+}
+
+static char *
+grow_buf(char *old, size_t len, size_t ncap)
+{
+  char *nbuf = malloc(ncap);
+  if (!nbuf) return NULL;
+  if (len > 0) memcpy(nbuf, old, len);
+  wipe(old, len);
+  free(old);
+  return nbuf;
+}
+
+static int
+buf_append(char **buf, size_t *len, size_t *cap, const char *data, size_t n)
+{
+  if (n == 0) return 0;
+  if (*cap - *len < n) {
+    size_t ncap = (*len + n) * 2;
+    char *nbuf = grow_buf(*buf, *len, ncap);
+    if (!nbuf) return ENOMEM;
+    *buf = nbuf;
+    *cap = ncap;
+  }
+  memcpy(*buf + *len, data, n);
+  *len += n;
+  return 0;
+}
+
+static void
 close_fd(int *fd)
 {
   if (*fd >= 0) {
@@ -297,7 +331,7 @@ job_run(job_t *j)
       ssize_t r;
       if (cap - len < IO_CHUNK) {
         size_t ncap = cap ? cap * 2 : IO_CHUNK * 2;
-        char *nbuf = realloc(buf, ncap);
+        char *nbuf = grow_buf(buf, len, ncap);
         if (!nbuf) {
           rc = ENOMEM;
           failed = 1;
@@ -352,6 +386,7 @@ cleanup:
   free(links);
   free(pids);
   if (failed) {
+    wipe(buf, len);
     free(buf);
     return rc;
   }
@@ -369,24 +404,13 @@ free_argvs(char ***argvs, int n)
   free(argvs);
 }
 
-static mrb_value
-spawn_exec(mrb_state *mrb, mrb_value self)
+
+static void
+validate_pipeline(mrb_state *mrb, mrb_value argvs_v)
 {
-  mrb_value argvs_v, stdin_v;
-  mrb_int err_mode, capture;
-  struct RClass *spawn_mod, *error_class;
-  mrb_int n, i, k;
-  job_t job;
-  char ***argvs;
-  int rc;
-  mrb_value result, statuses;
+  mrb_int n = RARRAY_LEN(argvs_v), i, k;
 
-  mrb_get_args(mrb, "Aoii", &argvs_v, &stdin_v, &err_mode, &capture);
-
-  n = RARRAY_LEN(argvs_v);
   if (n < 1) mrb_raise(mrb, E_ARGUMENT_ERROR, "argv must not be empty");
-  if (err_mode < ERR_MERGE || err_mode > ERR_INHERIT) mrb_raise(mrb, E_ARGUMENT_ERROR, "invalid err mode");
-
   for (i = 0; i < n; i++) {
     mrb_value av = mrb_ary_ref(mrb, argvs_v, i);
     mrb_int an;
@@ -399,6 +423,91 @@ spawn_exec(mrb_state *mrb, mrb_value self)
       mrb_string_value_cstr(mrb, &s);
     }
   }
+}
+
+static char ***
+build_argvs(mrb_state *mrb, mrb_value argvs_v)
+{
+  mrb_int n = RARRAY_LEN(argvs_v), i, k;
+  char ***argvs = calloc((size_t)n, sizeof(char **));
+
+  if (!argvs) return NULL;
+  for (i = 0; i < n; i++) {
+    mrb_value av = mrb_ary_ref(mrb, argvs_v, i);
+    mrb_int an = RARRAY_LEN(av);
+    argvs[i] = malloc(sizeof(char *) * (size_t)(an + 1));
+    if (!argvs[i]) {
+      free_argvs(argvs, (int)n);
+      return NULL;
+    }
+    for (k = 0; k < an; k++) {
+      mrb_value s = mrb_ary_ref(mrb, av, k);
+      argvs[i][k] = (char *)RSTRING_PTR(s);
+    }
+    argvs[i][an] = NULL;
+  }
+  return argvs;
+}
+
+static void
+raise_spawn_error(mrb_state *mrb, int rc, int fail_index, mrb_value argvs_v)
+{
+  struct RClass *spawn_mod = mrb_module_get_under(mrb, mrb_module_get(mrb, "Picorake"), "Spawn");
+  struct RClass *error_class = mrb_class_get_under(mrb, spawn_mod, "Error");
+
+  if (fail_index >= 0) {
+    mrb_value av = mrb_ary_ref(mrb, argvs_v, fail_index);
+    mrb_value cmd = mrb_ary_ref(mrb, av, 0);
+    mrb_raisef(mrb, error_class, "%v: %s", cmd, strerror(rc));
+  }
+  mrb_raisef(mrb, error_class, "%s", strerror(rc));
+}
+
+static mrb_value
+exec_result(mrb_state *mrb, job_t *job, int rc, mrb_value argvs_v)
+{
+  mrb_int n = job->n, i;
+  mrb_value result, statuses;
+
+  if (rc != 0) {
+    int fail_index = job->fail_index;
+    free(job->statuses);
+    raise_spawn_error(mrb, rc, fail_index, argvs_v);
+  }
+
+  statuses = mrb_ary_new_capa(mrb, n);
+  for (i = 0; i < n; i++) mrb_ary_push(mrb, statuses, mrb_fixnum_value(job->statuses[i]));
+  free(job->statuses);
+
+  result = mrb_ary_new_capa(mrb, 2);
+  if (job->capture) {
+    mrb_value out = mrb_str_new(mrb, job->out ? job->out : "", (mrb_int)job->out_len);
+    free(job->out);
+    mrb_ary_push(mrb, result, out);
+  }
+  else {
+    free(job->out);
+    mrb_ary_push(mrb, result, mrb_nil_value());
+  }
+  mrb_ary_push(mrb, result, statuses);
+  return result;
+}
+
+static mrb_value
+spawn_exec(mrb_state *mrb, mrb_value self)
+{
+  mrb_value argvs_v, stdin_v;
+  mrb_int err_mode, capture, n;
+  job_t job;
+  char ***argvs;
+  int rc;
+
+  mrb_get_args(mrb, "Aoii", &argvs_v, &stdin_v, &err_mode, &capture);
+
+  n = RARRAY_LEN(argvs_v);
+  if (n < 1) mrb_raise(mrb, E_ARGUMENT_ERROR, "argv must not be empty");
+  if (err_mode < ERR_MERGE || err_mode > ERR_INHERIT) mrb_raise(mrb, E_ARGUMENT_ERROR, "invalid err mode");
+  validate_pipeline(mrb, argvs_v);
 
   memset(&job, 0, sizeof(job));
   if (mrb_nil_p(stdin_v)) {
@@ -413,27 +522,12 @@ spawn_exec(mrb_state *mrb, mrb_value self)
     mrb_raise(mrb, E_ARGUMENT_ERROR, "stdin must be a String or nil");
   }
 
-  argvs = calloc((size_t)n, sizeof(char **));
+  argvs = build_argvs(mrb, argvs_v);
   job.statuses = calloc((size_t)n, sizeof(int));
   if (!argvs || !job.statuses) {
-    free(argvs);
+    free_argvs(argvs, (int)n);
     free(job.statuses);
     mrb_raise(mrb, E_RUNTIME_ERROR, "out of memory");
-  }
-  for (i = 0; i < n; i++) {
-    mrb_value av = mrb_ary_ref(mrb, argvs_v, i);
-    mrb_int an = RARRAY_LEN(av);
-    argvs[i] = malloc(sizeof(char *) * (size_t)(an + 1));
-    if (!argvs[i]) {
-      free_argvs(argvs, (int)n);
-      free(job.statuses);
-      mrb_raise(mrb, E_RUNTIME_ERROR, "out of memory");
-    }
-    for (k = 0; k < an; k++) {
-      mrb_value s = mrb_ary_ref(mrb, av, k);
-      argvs[i][k] = (char *)RSTRING_PTR(s);
-    }
-    argvs[i][an] = NULL;
   }
 
   job.argvs = argvs;
@@ -443,36 +537,137 @@ spawn_exec(mrb_state *mrb, mrb_value self)
 
   rc = job_run(&job);
   free_argvs(argvs, (int)n);
+  return exec_result(mrb, &job, rc, argvs_v);
+}
+
+typedef struct {
+  char ***argvs;
+  int n;
+} feeder_t;
+
+static void
+free_feeders(feeder_t *feeders, mrb_int nf)
+{
+  mrb_int i;
+  if (!feeders) return;
+  for (i = 0; i < nf; i++) free_argvs(feeders[i].argvs, feeders[i].n);
+  free(feeders);
+}
+
+static mrb_value
+spawn_exec_feed(mrb_state *mrb, mrb_value self)
+{
+  mrb_value argvs_v, feeders_v, result;
+  mrb_int err_mode, capture, n, nf, i, k;
+  job_t job;
+  feeder_t *feeders;
+  char ***argvs;
+  char *buf = NULL;
+  size_t blen = 0, bcap = 0;
+  int rc = 0, spawn_feeder = -1, spawn_index = -1, feed_index = -1, feed_status = 0;
+
+  mrb_get_args(mrb, "AAii", &argvs_v, &feeders_v, &err_mode, &capture);
+
+  n = RARRAY_LEN(argvs_v);
+  nf = RARRAY_LEN(feeders_v);
+  if (err_mode < ERR_MERGE || err_mode > ERR_INHERIT) mrb_raise(mrb, E_ARGUMENT_ERROR, "invalid err mode");
+  validate_pipeline(mrb, argvs_v);
+  for (i = 0; i < nf; i++) {
+    mrb_value fv = mrb_ary_ref(mrb, feeders_v, i);
+    if (!mrb_array_p(fv)) mrb_raise(mrb, E_ARGUMENT_ERROR, "stdin_from must be an Array of pipelines");
+    validate_pipeline(mrb, fv);
+  }
+
+  feeders = calloc((size_t)(nf > 0 ? nf : 1), sizeof(feeder_t));
+  argvs = build_argvs(mrb, argvs_v);
+  if (!feeders || !argvs) {
+    free(feeders);
+    free_argvs(argvs, (int)n);
+    mrb_raise(mrb, E_RUNTIME_ERROR, "out of memory");
+  }
+  for (i = 0; i < nf; i++) {
+    mrb_value fv = mrb_ary_ref(mrb, feeders_v, i);
+    feeders[i].n = (int)RARRAY_LEN(fv);
+    feeders[i].argvs = build_argvs(mrb, fv);
+    if (!feeders[i].argvs) {
+      free_feeders(feeders, nf);
+      free_argvs(argvs, (int)n);
+      mrb_raise(mrb, E_RUNTIME_ERROR, "out of memory");
+    }
+  }
+
+  for (i = 0; i < nf && rc == 0 && feed_status == 0; i++) {
+    job_t fj;
+    memset(&fj, 0, sizeof(fj));
+    fj.argvs = feeders[i].argvs;
+    fj.n = feeders[i].n;
+    fj.err_mode = ERR_NULL;
+    fj.capture = 1;
+    fj.statuses = calloc((size_t)fj.n, sizeof(int));
+    if (!fj.statuses) {
+      rc = ENOMEM;
+      break;
+    }
+    rc = job_run(&fj);
+    if (rc != 0) {
+      spawn_feeder = (int)i;
+      spawn_index = fj.fail_index;
+    }
+    else {
+      for (k = 0; k < fj.n; k++) {
+        if (fj.statuses[k] != 0) {
+          feed_index = (int)i;
+          feed_status = fj.statuses[k];
+          break;
+        }
+      }
+      if (feed_status == 0) rc = buf_append(&buf, &blen, &bcap, fj.out, fj.out_len);
+      wipe(fj.out, fj.out_len);
+      free(fj.out);
+    }
+    free(fj.statuses);
+  }
+  free_feeders(feeders, nf);
 
   if (rc != 0) {
-    int fail_index = job.fail_index;
-    free(job.statuses);
-    spawn_mod = mrb_module_get_under(mrb, mrb_module_get(mrb, "Picorake"), "Spawn");
-    error_class = mrb_class_get_under(mrb, spawn_mod, "Error");
-    if (fail_index >= 0) {
-      mrb_value av = mrb_ary_ref(mrb, argvs_v, fail_index);
-      mrb_value cmd = mrb_ary_ref(mrb, av, 0);
-      mrb_raisef(mrb, error_class, "%v: %s", cmd, strerror(rc));
-    }
-    mrb_raisef(mrb, error_class, "%s", strerror(rc));
+    wipe(buf, blen);
+    free(buf);
+    free_argvs(argvs, (int)n);
+    if (spawn_feeder >= 0) raise_spawn_error(mrb, rc, spawn_index, mrb_ary_ref(mrb, feeders_v, spawn_feeder));
+    raise_spawn_error(mrb, rc, -1, argvs_v);
   }
-
-  statuses = mrb_ary_new_capa(mrb, n);
-  for (i = 0; i < n; i++) mrb_ary_push(mrb, statuses, mrb_fixnum_value(job.statuses[i]));
-  free(job.statuses);
-
-  result = mrb_ary_new_capa(mrb, 2);
-  if (job.capture) {
-    mrb_value out = mrb_str_new(mrb, job.out ? job.out : "", (mrb_int)job.out_len);
-    free(job.out);
-    mrb_ary_push(mrb, result, out);
-  }
-  else {
-    free(job.out);
+  if (feed_status != 0) {
+    wipe(buf, blen);
+    free(buf);
+    free_argvs(argvs, (int)n);
+    result = mrb_ary_new_capa(mrb, 3);
     mrb_ary_push(mrb, result, mrb_nil_value());
+    mrb_ary_push(mrb, result, mrb_nil_value());
+    mrb_ary_push(mrb, result, mrb_ary_new_from_values(mrb, 2, (mrb_value[]){mrb_fixnum_value(feed_index), mrb_fixnum_value(feed_status)}));
+    return result;
   }
-  mrb_ary_push(mrb, result, statuses);
-  return result;
+
+  memset(&job, 0, sizeof(job));
+  job.has_in = 1;
+  job.in_data = buf;
+  job.in_len = blen;
+  job.argvs = argvs;
+  job.n = (int)n;
+  job.err_mode = (int)err_mode;
+  job.capture = capture ? 1 : 0;
+  job.statuses = calloc((size_t)n, sizeof(int));
+  if (!job.statuses) {
+    wipe(buf, blen);
+    free(buf);
+    free_argvs(argvs, (int)n);
+    mrb_raise(mrb, E_RUNTIME_ERROR, "out of memory");
+  }
+
+  rc = job_run(&job);
+  wipe(buf, blen);
+  free(buf);
+  free_argvs(argvs, (int)n);
+  return exec_result(mrb, &job, rc, argvs_v);
 }
 
 void
@@ -482,6 +677,7 @@ mrb_picorake_spawn_gem_init(mrb_state *mrb)
   struct RClass *spawn = mrb_define_module_under(mrb, picorake, "Spawn");
   mrb_define_class_under(mrb, spawn, "Error", E_STANDARD_ERROR);
   mrb_define_module_function(mrb, spawn, "_exec", spawn_exec, MRB_ARGS_REQ(4));
+  mrb_define_module_function(mrb, spawn, "_exec_feed", spawn_exec_feed, MRB_ARGS_REQ(4));
 }
 
 void

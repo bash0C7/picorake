@@ -233,6 +233,99 @@ class SpawnTest < Picotest::Test
     assert_raise(ArgumentError) { Picorake::Spawn.pipeline([["/bin/cat"]], err: :bogus) }
   end
 
+  def test_stdin_from_concatenates_feeder_outputs_in_order
+    feeders = [[[PRINTF, "%s\n", "a"]], [[PRINTF, "%s", "b c"], ["/usr/bin/tr", "a-z", "A-Z"]]]
+    output, status = Picorake::Spawn.run(["/bin/cat"], stdin_from: feeders)
+    assert_equal(0, status)
+    assert_equal("a\nB C", output)
+  end
+
+  def test_stdin_from_failing_feeder_raises_feed_error_and_skips_the_consumer
+    dir, dir_status = Picorake::Spawn.run(["/usr/bin/mktemp", "-d"])
+    assert_equal(0, dir_status)
+    dir = dir.strip
+    trace = dir + "/trace"
+    error = nil
+    begin
+      Picorake::Spawn.run(["/usr/bin/touch", trace], stdin_from: [[[PRINTF, "%s", "x"]], [["/usr/bin/false"]]])
+    rescue Picorake::Spawn::FeedError => e
+      error = e
+    end
+    _out, exists = Picorake::Spawn.run(["/bin/test", "-e", trace])
+    Picorake::Spawn.run(["/bin/rm", "-rf", dir])
+    assert_equal(true, !error.nil?)
+    assert_equal(1, error.index)
+    assert_equal(1, error.status)
+    assert_equal("feeder 1 exited 1", error.message)
+    assert_equal(1, exists)
+  end
+
+  def test_feed_error_is_a_spawn_error
+    assert_equal(true, Picorake::Spawn::FeedError.ancestors.include?(Picorake::Spawn::Error))
+  end
+
+  def test_stdin_from_and_stdin_are_mutually_exclusive
+    assert_raise(ArgumentError) do
+      Picorake::Spawn.run(["/bin/cat"], stdin: "x", stdin_from: [[[PRINTF, "%s", "y"]]])
+    end
+  end
+
+  def test_stdin_from_invalid_values_raise_argument_error
+    assert_raise(ArgumentError) { Picorake::Spawn.run(["/bin/cat"], stdin_from: "x") }
+    assert_raise(ArgumentError) { Picorake::Spawn.run(["/bin/cat"], stdin_from: [[]]) }
+    assert_raise(ArgumentError) { Picorake::Spawn.run(["/bin/cat"], stdin_from: [["/bin/cat"]]) }
+    assert_raise(ArgumentError) { Picorake::Spawn.run(["/bin/cat"], stdin_from: [[["/bin/echo", 1]]]) }
+  end
+
+  def test_stdin_from_feeder_start_failure_raises_error
+    assert_raise(Picorake::Spawn::Error) do
+      Picorake::Spawn.run(["/bin/cat"], stdin_from: [[[PRINTF, "%s", "x"]], [["/picorake/no/such/command"]]])
+    end
+  end
+
+  def test_stdin_from_large_feeder_output_round_trips_without_deadlock
+    feeders = [[["/usr/bin/perl", "-e", 'print "0123456789abcdef" x 80000']]]
+    output, status = Picorake::Spawn.run(["/bin/cat"], stdin_from: feeders)
+    assert_equal(0, status)
+    assert_equal(1_280_000, output.bytesize)
+    assert_equal(true, output == "0123456789abcdef" * 80_000)
+  end
+
+  def test_stdin_from_empty_feeders_gives_eof
+    output, status = Picorake::Spawn.run(["/bin/cat"], stdin_from: [])
+    assert_equal(0, status)
+    assert_equal("", output)
+  end
+
+  def test_stdin_from_honours_out_inherit
+    status = Picorake::Spawn.run(["/bin/cat"], stdin_from: [[[PRINTF, "%s", ""]]], out: :inherit)
+    assert_equal(0, status)
+  end
+
+  def awk_formatter(value)
+    program = "{ if ($0 ~ /^[A-Za-z0-9._~+\\/=-]+$/) printf \"%s%s\\\"\\n\", prefix, $0; else exit 120 }"
+    [[PRINTF, "%s", value], ["/usr/bin/awk", "-v", "prefix=header = \"Authorization: Bearer ", program]]
+  end
+
+  def test_stdin_from_awk_formats_a_safe_value
+    output, status = Picorake::Spawn.run(["/bin/cat"], stdin_from: [awk_formatter("abc123")])
+    assert_equal(0, status)
+    assert_equal("header = \"Authorization: Bearer abc123\"\n", output)
+  end
+
+  def test_stdin_from_awk_rejects_an_unsafe_value
+    error = nil
+    begin
+      Picorake::Spawn.run(["/bin/cat"], stdin_from: [awk_formatter("abc\"def")])
+    rescue Picorake::Spawn::FeedError => e
+      error = e
+    end
+    assert_equal(true, !error.nil?)
+    assert_equal(0, error.index)
+    assert_equal(120, error.status)
+    assert_equal(false, error.message.include?("abc"))
+  end
+
   def test_child_does_not_inherit_the_parents_other_fds
     script = 'print join(",", grep { -e "/dev/fd/$_" } 0..63)'
     output, status = Picorake::Spawn.run(["/usr/bin/perl", "-e", script], stdin: "x")
