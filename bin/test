@@ -1,8 +1,12 @@
 #!/bin/sh
 set -eu
-: "${PICORUBY:?PICORUBY must be the path to the PicoRuby VM binary}"
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
+if [ -z "${PICORUBY:-}" ]; then
+  "$ROOT/bin/picoruby-vm" ensure
+  PICORUBY=$("$ROOT/bin/picoruby-vm" binary)
+fi
+export PICORUBY
 cd "$ROOT"
-set -- mrbgems/picorake/mrblib/*.rb
+set -- mrbgems/picorake/mrblib/*.rb mrbgems/picorake-spawn/mrblib/*.rb
 trap '' PIPE
 exec "$PICORUBY" test/runner.rb "$ROOT" test "$@"

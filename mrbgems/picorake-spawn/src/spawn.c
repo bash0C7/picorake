@@ -1,0 +1,490 @@
+#define _GNU_SOURCE
+
+#include <errno.h>
+#include <fcntl.h>
+#include <poll.h>
+#include <signal.h>
+#include <spawn.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/types.h>
+#include <sys/wait.h>
+#include <unistd.h>
+
+#include <mruby.h>
+#include <mruby/array.h>
+#include <mruby/class.h>
+#include <mruby/string.h>
+
+extern char **environ;
+
+#define ERR_MERGE 0
+#define ERR_NULL 1
+#define ERR_INHERIT 2
+
+#define IO_CHUNK 65536
+
+#if defined(__GLIBC__) && (__GLIBC__ > 2 || (__GLIBC__ == 2 && __GLIBC_MINOR__ >= 34))
+#define HAVE_ADDCLOSEFROM 1
+#endif
+
+typedef struct {
+  char ***argvs;
+  int n;
+  const char *in_data;
+  size_t in_len;
+  int has_in;
+  int err_mode;
+  int capture;
+  char *out;
+  size_t out_len;
+  int *statuses;
+  int fail_index;
+} job_t;
+
+static void
+close_fd(int *fd)
+{
+  if (*fd >= 0) {
+    close(*fd);
+    *fd = -1;
+  }
+}
+
+static int
+make_pipe(int p[2])
+{
+  int raw[2], i;
+
+  p[0] = p[1] = -1;
+  if (pipe(raw) < 0) return errno;
+  for (i = 0; i < 2; i++) {
+    int fd = fcntl(raw[i], F_DUPFD_CLOEXEC, 3);
+    if (fd < 0) {
+      int e = errno;
+      close(raw[0]);
+      close(raw[1]);
+      if (p[0] >= 0) close(p[0]);
+      p[0] = p[1] = -1;
+      return e;
+    }
+    p[i] = fd;
+  }
+  close(raw[0]);
+  close(raw[1]);
+  return 0;
+}
+
+static int
+set_nonblock(int fd)
+{
+  int flags = fcntl(fd, F_GETFL);
+  if (flags < 0) return errno;
+  if (fcntl(fd, F_SETFL, flags | O_NONBLOCK) < 0) return errno;
+  return 0;
+}
+
+static int
+inherit_fd(posix_spawn_file_actions_t *fa, int fd)
+{
+#if defined(__APPLE__)
+  return posix_spawn_file_actions_addinherit_np(fa, fd);
+#else
+  (void)fa;
+  (void)fd;
+  return 0;
+#endif
+}
+
+static int
+build_actions(posix_spawn_file_actions_t *fa, const job_t *j, int i,
+              int in_r, int cap_w, int (*links)[2])
+{
+  int rc;
+  int last = (i == j->n - 1);
+  int stdin_src = (i == 0) ? in_r : links[i - 1][0];
+  int stdout_dst = last ? (j->capture ? cap_w : -1) : links[i][1];
+
+  switch (j->err_mode) {
+  case ERR_MERGE:
+    if ((rc = posix_spawn_file_actions_adddup2(fa, j->capture ? cap_w : 1, 2)) != 0) return rc;
+    break;
+  case ERR_NULL:
+    if ((rc = posix_spawn_file_actions_addopen(fa, 2, "/dev/null", O_WRONLY, 0)) != 0) return rc;
+    break;
+  default:
+    if ((rc = inherit_fd(fa, 2)) != 0) return rc;
+    break;
+  }
+
+  if (stdout_dst >= 0) {
+    if ((rc = posix_spawn_file_actions_adddup2(fa, stdout_dst, 1)) != 0) return rc;
+  }
+  else {
+    if ((rc = inherit_fd(fa, 1)) != 0) return rc;
+  }
+
+  if (stdin_src >= 0) {
+    if ((rc = posix_spawn_file_actions_adddup2(fa, stdin_src, 0)) != 0) return rc;
+  }
+  else {
+    if ((rc = posix_spawn_file_actions_addopen(fa, 0, "/dev/null", O_RDONLY, 0)) != 0) return rc;
+  }
+
+#if defined(HAVE_ADDCLOSEFROM)
+  if ((rc = posix_spawn_file_actions_addclosefrom_np(fa, 3)) != 0) return rc;
+#endif
+  return 0;
+}
+
+static void
+reap(pid_t *pids, int started, int kill_first)
+{
+  int i;
+  for (i = 0; i < started; i++) {
+    int st;
+    if (kill_first) kill(pids[i], SIGKILL);
+    while (waitpid(pids[i], &st, 0) < 0 && errno == EINTR) {}
+  }
+}
+
+static int
+job_run(job_t *j)
+{
+  int n = j->n, i, rc = 0, started = 0, failed = 0;
+  int in_r = -1, in_w = -1, cap_r = -1, cap_w = -1;
+  int (*links)[2];
+  pid_t *pids;
+  posix_spawnattr_t attr;
+  int attr_ok = 0;
+  struct sigaction ign, old;
+  int sig_saved = 0;
+  char *buf = NULL;
+  size_t cap = 0, len = 0, off = 0;
+  short flags;
+
+  j->fail_index = -1;
+  j->out = NULL;
+  j->out_len = 0;
+
+  links = malloc(sizeof(int[2]) * (size_t)n);
+  pids = malloc(sizeof(pid_t) * (size_t)n);
+  if (!links || !pids) {
+    free(links);
+    free(pids);
+    return ENOMEM;
+  }
+  for (i = 0; i < n; i++) links[i][0] = links[i][1] = -1;
+
+  memset(&ign, 0, sizeof(ign));
+  ign.sa_handler = SIG_IGN;
+  sigemptyset(&ign.sa_mask);
+  if (sigaction(SIGPIPE, &ign, &old) == 0) sig_saved = 1;
+
+  for (i = 0; i < n - 1 && !rc; i++) rc = make_pipe(links[i]);
+  if (!rc && j->has_in) {
+    int p[2];
+    if ((rc = make_pipe(p)) == 0) {
+      in_r = p[0];
+      in_w = p[1];
+    }
+  }
+  if (!rc && j->capture) {
+    int p[2];
+    if ((rc = make_pipe(p)) == 0) {
+      cap_r = p[0];
+      cap_w = p[1];
+    }
+  }
+
+  if (!rc) {
+    rc = posix_spawnattr_init(&attr);
+    if (rc == 0) attr_ok = 1;
+  }
+  if (!rc) {
+    sigset_t mask, def;
+    sigemptyset(&mask);
+    sigemptyset(&def);
+    sigaddset(&def, SIGPIPE);
+    flags = POSIX_SPAWN_SETSIGMASK | POSIX_SPAWN_SETSIGDEF;
+#if defined(POSIX_SPAWN_CLOEXEC_DEFAULT)
+    flags |= POSIX_SPAWN_CLOEXEC_DEFAULT;
+#endif
+    if ((rc = posix_spawnattr_setflags(&attr, flags)) == 0 &&
+        (rc = posix_spawnattr_setsigmask(&attr, &mask)) == 0) {
+      rc = posix_spawnattr_setsigdefault(&attr, &def);
+    }
+  }
+
+  for (i = 0; i < n && !rc; i++) {
+    posix_spawn_file_actions_t fa;
+    if ((rc = posix_spawn_file_actions_init(&fa)) != 0) break;
+    rc = build_actions(&fa, j, i, in_r, cap_w, links);
+    if (rc == 0) rc = posix_spawnp(&pids[i], j->argvs[i][0], &fa, &attr, j->argvs[i], environ);
+    posix_spawn_file_actions_destroy(&fa);
+    if (rc != 0) {
+      j->fail_index = i;
+      break;
+    }
+    started++;
+    if (i == 0) close_fd(&in_r);
+    if (i > 0) close_fd(&links[i - 1][0]);
+    if (i < n - 1) close_fd(&links[i][1]);
+  }
+  if (rc) {
+    failed = 1;
+    goto cleanup;
+  }
+
+  close_fd(&cap_w);
+  close_fd(&in_r);
+
+  if (in_w >= 0 && j->in_len == 0) close_fd(&in_w);
+  if (in_w >= 0 && (rc = set_nonblock(in_w)) != 0) {
+    failed = 1;
+    goto cleanup;
+  }
+
+  while (in_w >= 0 || cap_r >= 0) {
+    struct pollfd p[2];
+    int nfds = 0, wi = -1, ri = -1, pr;
+
+    if (in_w >= 0) {
+      p[nfds].fd = in_w;
+      p[nfds].events = POLLOUT;
+      p[nfds].revents = 0;
+      wi = nfds++;
+    }
+    if (cap_r >= 0) {
+      p[nfds].fd = cap_r;
+      p[nfds].events = POLLIN;
+      p[nfds].revents = 0;
+      ri = nfds++;
+    }
+    pr = poll(p, (nfds_t)nfds, -1);
+    if (pr < 0) {
+      if (errno == EINTR) continue;
+      rc = errno;
+      failed = 1;
+      goto cleanup;
+    }
+
+    if (wi >= 0 && p[wi].revents) {
+      if (p[wi].revents & POLLOUT) {
+        size_t want = j->in_len - off;
+        ssize_t w;
+        if (want > IO_CHUNK) want = IO_CHUNK;
+        w = write(in_w, j->in_data + off, want);
+        if (w < 0) {
+          if (errno == EPIPE) close_fd(&in_w);
+          else if (errno != EAGAIN && errno != EINTR) {
+            rc = errno;
+            failed = 1;
+            goto cleanup;
+          }
+        }
+        else {
+          off += (size_t)w;
+          if (off == j->in_len) close_fd(&in_w);
+        }
+      }
+      else {
+        close_fd(&in_w);
+      }
+    }
+
+    if (ri >= 0 && p[ri].revents) {
+      ssize_t r;
+      if (cap - len < IO_CHUNK) {
+        size_t ncap = cap ? cap * 2 : IO_CHUNK * 2;
+        char *nbuf = realloc(buf, ncap);
+        if (!nbuf) {
+          rc = ENOMEM;
+          failed = 1;
+          goto cleanup;
+        }
+        buf = nbuf;
+        cap = ncap;
+      }
+      r = read(cap_r, buf + len, cap - len);
+      if (r < 0) {
+        if (errno != EINTR && errno != EAGAIN) {
+          rc = errno;
+          failed = 1;
+          goto cleanup;
+        }
+      }
+      else if (r == 0) {
+        close_fd(&cap_r);
+      }
+      else {
+        len += (size_t)r;
+      }
+    }
+  }
+
+  for (i = 0; i < n; i++) {
+    int st = 0;
+    while (waitpid(pids[i], &st, 0) < 0) {
+      if (errno != EINTR) {
+        st = 0;
+        break;
+      }
+    }
+    if (WIFEXITED(st)) j->statuses[i] = WEXITSTATUS(st);
+    else if (WIFSIGNALED(st)) j->statuses[i] = 128 + WTERMSIG(st);
+    else j->statuses[i] = st;
+  }
+  started = 0;
+
+cleanup:
+  close_fd(&in_r);
+  close_fd(&in_w);
+  close_fd(&cap_r);
+  close_fd(&cap_w);
+  for (i = 0; i < n; i++) {
+    close_fd(&links[i][0]);
+    close_fd(&links[i][1]);
+  }
+  if (failed) reap(pids, started, 1);
+  if (attr_ok) posix_spawnattr_destroy(&attr);
+  if (sig_saved) sigaction(SIGPIPE, &old, NULL);
+  free(links);
+  free(pids);
+  if (failed) {
+    free(buf);
+    return rc;
+  }
+  j->out = buf;
+  j->out_len = len;
+  return 0;
+}
+
+static void
+free_argvs(char ***argvs, int n)
+{
+  int i;
+  if (!argvs) return;
+  for (i = 0; i < n; i++) free(argvs[i]);
+  free(argvs);
+}
+
+static mrb_value
+spawn_exec(mrb_state *mrb, mrb_value self)
+{
+  mrb_value argvs_v, stdin_v;
+  mrb_int err_mode, capture;
+  struct RClass *spawn_mod, *error_class;
+  mrb_int n, i, k;
+  job_t job;
+  char ***argvs;
+  int rc;
+  mrb_value result, statuses;
+
+  mrb_get_args(mrb, "Aoii", &argvs_v, &stdin_v, &err_mode, &capture);
+
+  n = RARRAY_LEN(argvs_v);
+  if (n < 1) mrb_raise(mrb, E_ARGUMENT_ERROR, "argv must not be empty");
+  if (err_mode < ERR_MERGE || err_mode > ERR_INHERIT) mrb_raise(mrb, E_ARGUMENT_ERROR, "invalid err mode");
+
+  for (i = 0; i < n; i++) {
+    mrb_value av = mrb_ary_ref(mrb, argvs_v, i);
+    mrb_int an;
+    if (!mrb_array_p(av)) mrb_raise(mrb, E_ARGUMENT_ERROR, "argv must be an Array");
+    an = RARRAY_LEN(av);
+    if (an < 1) mrb_raise(mrb, E_ARGUMENT_ERROR, "argv must not be empty");
+    for (k = 0; k < an; k++) {
+      mrb_value s = mrb_ary_ref(mrb, av, k);
+      if (!mrb_string_p(s)) mrb_raise(mrb, E_ARGUMENT_ERROR, "argv must contain only Strings");
+      mrb_string_value_cstr(mrb, &s);
+    }
+  }
+
+  memset(&job, 0, sizeof(job));
+  if (mrb_nil_p(stdin_v)) {
+    job.has_in = 0;
+  }
+  else if (mrb_string_p(stdin_v)) {
+    job.has_in = 1;
+    job.in_data = RSTRING_PTR(stdin_v);
+    job.in_len = (size_t)RSTRING_LEN(stdin_v);
+  }
+  else {
+    mrb_raise(mrb, E_ARGUMENT_ERROR, "stdin must be a String or nil");
+  }
+
+  argvs = calloc((size_t)n, sizeof(char **));
+  job.statuses = calloc((size_t)n, sizeof(int));
+  if (!argvs || !job.statuses) {
+    free(argvs);
+    free(job.statuses);
+    mrb_raise(mrb, E_RUNTIME_ERROR, "out of memory");
+  }
+  for (i = 0; i < n; i++) {
+    mrb_value av = mrb_ary_ref(mrb, argvs_v, i);
+    mrb_int an = RARRAY_LEN(av);
+    argvs[i] = malloc(sizeof(char *) * (size_t)(an + 1));
+    if (!argvs[i]) {
+      free_argvs(argvs, (int)n);
+      free(job.statuses);
+      mrb_raise(mrb, E_RUNTIME_ERROR, "out of memory");
+    }
+    for (k = 0; k < an; k++) {
+      mrb_value s = mrb_ary_ref(mrb, av, k);
+      argvs[i][k] = (char *)RSTRING_PTR(s);
+    }
+    argvs[i][an] = NULL;
+  }
+
+  job.argvs = argvs;
+  job.n = (int)n;
+  job.err_mode = (int)err_mode;
+  job.capture = capture ? 1 : 0;
+
+  rc = job_run(&job);
+  free_argvs(argvs, (int)n);
+
+  if (rc != 0) {
+    int fail_index = job.fail_index;
+    free(job.statuses);
+    spawn_mod = mrb_module_get_under(mrb, mrb_module_get(mrb, "Picorake"), "Spawn");
+    error_class = mrb_class_get_under(mrb, spawn_mod, "Error");
+    if (fail_index >= 0) {
+      mrb_value av = mrb_ary_ref(mrb, argvs_v, fail_index);
+      mrb_value cmd = mrb_ary_ref(mrb, av, 0);
+      mrb_raisef(mrb, error_class, "%v: %s", cmd, strerror(rc));
+    }
+    mrb_raisef(mrb, error_class, "%s", strerror(rc));
+  }
+
+  statuses = mrb_ary_new_capa(mrb, n);
+  for (i = 0; i < n; i++) mrb_ary_push(mrb, statuses, mrb_fixnum_value(job.statuses[i]));
+  free(job.statuses);
+
+  result = mrb_ary_new_capa(mrb, 2);
+  if (job.capture) {
+    mrb_value out = mrb_str_new(mrb, job.out ? job.out : "", (mrb_int)job.out_len);
+    free(job.out);
+    mrb_ary_push(mrb, result, out);
+  }
+  else {
+    free(job.out);
+    mrb_ary_push(mrb, result, mrb_nil_value());
+  }
+  mrb_ary_push(mrb, result, statuses);
+  return result;
+}
+
+void
+mrb_picorake_spawn_gem_init(mrb_state *mrb)
+{
+  struct RClass *picorake = mrb_define_module(mrb, "Picorake");
+  struct RClass *spawn = mrb_define_module_under(mrb, picorake, "Spawn");
+  mrb_define_class_under(mrb, spawn, "Error", E_STANDARD_ERROR);
+  mrb_define_module_function(mrb, spawn, "_exec", spawn_exec, MRB_ARGS_REQ(4));
+}
+
+void
+mrb_picorake_spawn_gem_final(mrb_state *mrb)
+{
+}

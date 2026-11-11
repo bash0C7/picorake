@@ -1,0 +1,78 @@
+#!/bin/sh
+set -eu
+
+SHA="d7a38804461d833a97c68fca12c6051a0dcf4e5a"
+REPO="https://github.com/picoruby/picoruby.git"
+CONFIG_REL="build_config/host.rb"
+CRUBY_VERSION="4.0.9"
+
+ROOT=$(cd "$(dirname "$0")/.." && pwd)
+DIR="$ROOT/vendor/picoruby"
+BINARY="$DIR/build/host/bin/picoruby"
+STAMP="$ROOT/vendor/.picoruby-vm-sha"
+CONFIG="$ROOT/$CONFIG_REL"
+
+sha256_stdin() {
+  if command -v sha256sum >/dev/null 2>&1; then sha256sum | cut -d' ' -f1; else shasum -a 256 | cut -d' ' -f1; fi
+}
+
+mrbgems_hash() {
+  (cd "$ROOT" && find mrbgems -type f | LC_ALL=C sort | while IFS= read -r f; do
+    printf '%s %s\n' "$(sha256_stdin < "$f")" "$f"
+  done) | sha256_stdin
+}
+
+build_id() { printf '%s:%s:%s' "$SHA" "$(sha256_stdin < "$CONFIG")" "$(mrbgems_hash)"; }
+
+stale() {
+  [ -f "$BINARY" ] || return 0
+  [ -f "$STAMP" ] || return 0
+  [ "$(cat "$STAMP")" = "$(build_id)" ] && return 1
+  return 0
+}
+
+checkout_complete() {
+  [ -e "$DIR/.git" ] || return 1
+  git -C "$DIR" rev-parse --verify -q HEAD >/dev/null 2>&1 || return 1
+  porcelain=$(git -C "$DIR" status --porcelain 2>&1) || return 1
+  [ -z "$porcelain" ] || return 1
+  status=$(git -C "$DIR" submodule status --recursive 2>&1) || return 1
+  case "$status" in -*|*"
+-"*) return 1 ;;
+  esac
+}
+
+pinned_remote() { [ "$(git -C "$DIR" remote get-url origin 2>&1)" = "$REPO" ]; }
+
+clone() {
+  mkdir -p "$(dirname "$DIR")"
+  git -C "$ROOT" clone --no-checkout --depth 1 "$REPO" "$DIR"
+  git -C "$DIR" fetch --depth 1 origin "$SHA"
+  git -C "$DIR" checkout --quiet "$SHA"
+}
+
+ensure() {
+  stale || return 0
+  echo "building PicoRuby $SHA into $DIR" >&2
+  if ! { checkout_complete && pinned_remote; }; then rm -rf "$DIR"; fi
+  [ -e "$DIR/.git" ] || clone
+  actual=$(git -C "$DIR" rev-parse HEAD)
+  if [ "$actual" != "$SHA" ]; then
+    echo "picoruby commit mismatch: expected $SHA / actual $actual" >&2
+    exit 1
+  fi
+  git -C "$DIR" submodule update --init --depth 1 --recursive
+  rm -rf "$DIR/build"
+  (cd "$DIR" && PATH="$HOME/.rbenv/shims:$PATH" RBENV_VERSION="$CRUBY_VERSION" CONFIG="$CONFIG" rake)
+  mkdir -p "$(dirname "$STAMP")"
+  build_id > "$STAMP"
+}
+
+case "${1:-}" in
+  ensure) ensure ;;
+  stale) stale ;;
+  sha) echo "$SHA" ;;
+  binary) echo "$BINARY" ;;
+  dir) echo "$DIR" ;;
+  *) echo "usage: picoruby-vm ensure|stale|sha|binary|dir" >&2; exit 2 ;;
+esac
