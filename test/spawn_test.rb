@@ -255,8 +255,9 @@ class SpawnTest < Picotest::Test
     Picorake::Spawn.run(["/bin/rm", "-rf", dir])
     assert_equal(true, !error.nil?)
     assert_equal(1, error.index)
+    assert_equal(0, error.stage)
     assert_equal(1, error.status)
-    assert_equal("feeder 1 exited 1", error.message)
+    assert_equal("feeder 1 stage 0 exited 1", error.message)
     assert_equal(1, exists)
   end
 
@@ -322,8 +323,44 @@ class SpawnTest < Picotest::Test
     end
     assert_equal(true, !error.nil?)
     assert_equal(0, error.index)
+    assert_equal(1, error.stage)
     assert_equal(120, error.status)
     assert_equal(false, error.message.include?("abc"))
+  end
+
+  def feed_error_for(feeders)
+    error = nil
+    begin
+      Picorake::Spawn.run(["/bin/cat"], stdin_from: feeders)
+    rescue Picorake::Spawn::FeedError => e
+      error = e
+    end
+    error
+  end
+
+  def test_feed_error_reports_the_second_command_when_it_is_the_first_to_fail
+    error = feed_error_for([[[PRINTF, "%s", "x"], ["/bin/sh", "-c", "exit 44"]]])
+    assert_equal(true, !error.nil?)
+    assert_equal(0, error.index)
+    assert_equal(1, error.stage)
+    assert_equal(44, error.status)
+    assert_equal("feeder 0 stage 1 exited 44", error.message)
+  end
+
+  def test_feed_error_reports_the_first_command_when_it_fails
+    error = feed_error_for([[["/bin/sh", "-c", "exit 44"], ["/bin/cat"]]])
+    assert_equal(true, !error.nil?)
+    assert_equal(0, error.index)
+    assert_equal(0, error.stage)
+    assert_equal(44, error.status)
+    assert_equal("feeder 0 stage 0 exited 44", error.message)
+  end
+
+  def test_status_is_reported_when_sigchld_is_ignored_in_the_vm
+    code = 'p Picorake::Spawn.run(["/usr/bin/false"], out: :inherit)'
+    output, status = Picorake::Spawn.run(["/usr/bin/perl", "-e", '$SIG{CHLD} = "IGNORE"; exec @ARGV', ENV["PICORUBY"], "-e", code])
+    assert_equal(0, status)
+    assert_equal("1\n", output)
   end
 
   def test_child_does_not_inherit_the_parents_other_fds

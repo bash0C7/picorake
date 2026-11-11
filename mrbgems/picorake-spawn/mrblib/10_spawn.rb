@@ -3,14 +3,19 @@ module Picorake
     ERR_MODES = { merge: 0, null: 1, inherit: 2 }
 
     class FeedError < Error
-      def initialize(index, status)
+      def initialize(index, stage, status)
         @index = index
+        @stage = stage
         @status = status
-        super("feeder #{index} exited #{status}")
+        super("feeder #{index} stage #{stage} exited #{status}")
       end
 
       def index
         @index
+      end
+
+      def stage
+        @stage
       end
 
       def status
@@ -27,7 +32,7 @@ module Picorake
     def self._run_exec(argvs, stdin, stdin_from, mode, capture)
       return _exec(argvs, stdin, mode, capture) if stdin_from.nil?
       output, statuses, failure = _exec_feed(argvs, stdin_from, mode, capture)
-      raise FeedError.new(failure[0], failure[1]) if failure
+      raise FeedError.new(failure[0], failure[2], failure[1]) if failure
       [output, statuses]
     end
 

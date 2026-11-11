@@ -40,6 +40,7 @@ typedef struct {
   size_t out_len;
   int *statuses;
   int fail_index;
+  const char *fail_op;
 } job_t;
 
 static void
@@ -191,13 +192,14 @@ job_run(job_t *j)
   pid_t *pids;
   posix_spawnattr_t attr;
   int attr_ok = 0;
-  struct sigaction ign, old;
-  int sig_saved = 0;
+  struct sigaction ign, dfl, old, old_chld;
+  int sig_saved = 0, chld_saved = 0, first_unreaped = 0;
   char *buf = NULL;
   size_t cap = 0, len = 0, off = 0;
   short flags;
 
   j->fail_index = -1;
+  j->fail_op = NULL;
   j->out = NULL;
   j->out_len = 0;
 
@@ -214,6 +216,10 @@ job_run(job_t *j)
   ign.sa_handler = SIG_IGN;
   sigemptyset(&ign.sa_mask);
   if (sigaction(SIGPIPE, &ign, &old) == 0) sig_saved = 1;
+  memset(&dfl, 0, sizeof(dfl));
+  dfl.sa_handler = SIG_DFL;
+  sigemptyset(&dfl.sa_mask);
+  if (sigaction(SIGCHLD, &dfl, &old_chld) == 0) chld_saved = 1;
 
   for (i = 0; i < n - 1 && !rc; i++) rc = make_pipe(links[i]);
   if (!rc && j->has_in) {
@@ -359,12 +365,17 @@ job_run(job_t *j)
 
   for (i = 0; i < n; i++) {
     int st = 0;
+    first_unreaped = i;
     while (waitpid(pids[i], &st, 0) < 0) {
       if (errno != EINTR) {
-        st = 0;
-        break;
+        rc = errno;
+        failed = 1;
+        j->fail_index = i;
+        j->fail_op = "waitpid";
+        goto cleanup;
       }
     }
+    first_unreaped = i + 1;
     if (WIFEXITED(st)) j->statuses[i] = WEXITSTATUS(st);
     else if (WIFSIGNALED(st)) j->statuses[i] = 128 + WTERMSIG(st);
     else j->statuses[i] = st;
@@ -380,8 +391,9 @@ cleanup:
     close_fd(&links[i][0]);
     close_fd(&links[i][1]);
   }
-  if (failed) reap(pids, started, 1);
+  if (failed) reap(pids + first_unreaped, started - first_unreaped, 1);
   if (attr_ok) posix_spawnattr_destroy(&attr);
+  if (chld_saved) sigaction(SIGCHLD, &old_chld, NULL);
   if (sig_saved) sigaction(SIGPIPE, &old, NULL);
   free(links);
   free(pids);
@@ -450,7 +462,7 @@ build_argvs(mrb_state *mrb, mrb_value argvs_v)
 }
 
 static void
-raise_spawn_error(mrb_state *mrb, int rc, int fail_index, mrb_value argvs_v)
+raise_spawn_error(mrb_state *mrb, int rc, int fail_index, const char *op, mrb_value argvs_v)
 {
   struct RClass *spawn_mod = mrb_module_get_under(mrb, mrb_module_get(mrb, "Picorake"), "Spawn");
   struct RClass *error_class = mrb_class_get_under(mrb, spawn_mod, "Error");
@@ -458,6 +470,7 @@ raise_spawn_error(mrb_state *mrb, int rc, int fail_index, mrb_value argvs_v)
   if (fail_index >= 0) {
     mrb_value av = mrb_ary_ref(mrb, argvs_v, fail_index);
     mrb_value cmd = mrb_ary_ref(mrb, av, 0);
+    if (op) mrb_raisef(mrb, error_class, "%v: %s: %s", cmd, op, strerror(rc));
     mrb_raisef(mrb, error_class, "%v: %s", cmd, strerror(rc));
   }
   mrb_raisef(mrb, error_class, "%s", strerror(rc));
@@ -471,8 +484,9 @@ exec_result(mrb_state *mrb, job_t *job, int rc, mrb_value argvs_v)
 
   if (rc != 0) {
     int fail_index = job->fail_index;
+    const char *op = job->fail_op;
     free(job->statuses);
-    raise_spawn_error(mrb, rc, fail_index, argvs_v);
+    raise_spawn_error(mrb, rc, fail_index, op, argvs_v);
   }
 
   statuses = mrb_ary_new_capa(mrb, n);
@@ -564,7 +578,8 @@ spawn_exec_feed(mrb_state *mrb, mrb_value self)
   char ***argvs;
   char *buf = NULL;
   size_t blen = 0, bcap = 0;
-  int rc = 0, spawn_feeder = -1, spawn_index = -1, feed_index = -1, feed_status = 0;
+  int rc = 0, spawn_feeder = -1, spawn_index = -1, feed_index = -1, feed_stage = -1, feed_status = 0;
+  const char *spawn_op = NULL;
 
   mrb_get_args(mrb, "AAii", &argvs_v, &feeders_v, &err_mode, &capture);
 
@@ -612,11 +627,13 @@ spawn_exec_feed(mrb_state *mrb, mrb_value self)
     if (rc != 0) {
       spawn_feeder = (int)i;
       spawn_index = fj.fail_index;
+      spawn_op = fj.fail_op;
     }
     else {
       for (k = 0; k < fj.n; k++) {
         if (fj.statuses[k] != 0) {
           feed_index = (int)i;
+          feed_stage = (int)k;
           feed_status = fj.statuses[k];
           break;
         }
@@ -633,8 +650,8 @@ spawn_exec_feed(mrb_state *mrb, mrb_value self)
     wipe(buf, blen);
     free(buf);
     free_argvs(argvs, (int)n);
-    if (spawn_feeder >= 0) raise_spawn_error(mrb, rc, spawn_index, mrb_ary_ref(mrb, feeders_v, spawn_feeder));
-    raise_spawn_error(mrb, rc, -1, argvs_v);
+    if (spawn_feeder >= 0) raise_spawn_error(mrb, rc, spawn_index, spawn_op, mrb_ary_ref(mrb, feeders_v, spawn_feeder));
+    raise_spawn_error(mrb, rc, -1, NULL, argvs_v);
   }
   if (feed_status != 0) {
     wipe(buf, blen);
@@ -643,7 +660,7 @@ spawn_exec_feed(mrb_state *mrb, mrb_value self)
     result = mrb_ary_new_capa(mrb, 3);
     mrb_ary_push(mrb, result, mrb_nil_value());
     mrb_ary_push(mrb, result, mrb_nil_value());
-    mrb_ary_push(mrb, result, mrb_ary_new_from_values(mrb, 2, (mrb_value[]){mrb_fixnum_value(feed_index), mrb_fixnum_value(feed_status)}));
+    mrb_ary_push(mrb, result, mrb_ary_new_from_values(mrb, 3, (mrb_value[]){mrb_fixnum_value(feed_index), mrb_fixnum_value(feed_status), mrb_fixnum_value(feed_stage)}));
     return result;
   }
 
