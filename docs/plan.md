@@ -24,7 +24,7 @@ PicoRubyの上で動く、Rakefileの書式のtask定義と前提の解決。mrb
 - 書式: `task`、`file`、`namespace`、`desc`、`task default:`、引数付きの`task :name, [:arg] => [:dep]`、`enhance`
 - 前提の解決: 前提を先に深さ優先で走らせ、1回の実行で同じtaskは1度だけ走らせ、循環していれば止める
 - 引数: 前提が同じ名前の引数を宣言しているときだけ、その値を前提へ渡す
-- `file`の判定: ファイルが無いか、前提のどれかが自分より新しいときに作る。普通の`task`の時刻は常に「今」
+- `file`の判定: ファイルが無いか、前提のどれかが自分より新しいときに作る。普通の`task`の時刻は常に「今」。taskの無い前提でも、そのファイルがあれば中身の無い`file`のtaskとして扱う
 - CLI: `-f`、`-T`、`-n`、`NAME=VALUE`、失敗したら0以外の終了コード。`sh`は失敗したら例外
 
 違うもの:
@@ -34,7 +34,6 @@ PicoRubyの上で動く、Rakefileの書式のtask定義と前提の解決。mrb
 | 並列(`multitask`、`-j`)を持たない | 今すぐ走らせる走り手を単純に保つ。並列は外の走り手(複数のworker)に任せる |
 | DSLを`Object`にprivateで`include`する | `load`で読んだfileの最上位のselfが、呼んだ側のselfと別のobjectになり、`extend`では届かない |
 | Rakefileが使えるgemは、VMに焼いたものだけ | PicoRubyに、実行時にgemを入れる仕組みが無い。純Rubyのfileは、翻訳器のある所なら実行時に`require`できる |
-| 前提に書いたfileは、`file`で宣言しないと見つからない | rakeは存在するfileのtaskを自動で作る。picorakeは持たない |
 | CLIは`load`のために相対pathをcwd基準の絶対pathに直す | PicoRubyの`load`は相対pathを`$LOAD_PATH`から探す |
 | `FileList`、`rule`、`import`、`directory`、`clean`、`rakelib/`の自動の読み込み、上のdirectoryへのRakefileの探索を持たない | 最初の約束を小さく保つ。要るものが出たら足す |
 

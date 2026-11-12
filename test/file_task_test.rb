@@ -127,6 +127,26 @@ class FileTaskTest < Picotest::Test
     assert_equal(["out b"], @log)
   end
 
+  def test_an_existing_file_without_a_task_becomes_a_file_task_like_rake
+    Picorake.file_stamper = lambda { |name| name == "src.txt" ? 200 : nil }
+    stamps["out"] = 100
+    task = file("out" => "src.txt") { @log << "out" }
+    assert_equal(true, task.needed?)
+    @app.invoke("out")
+    assert_equal(["out"], @log)
+    assert_equal(true, @app.lookup("src.txt").is_a?(Picorake::FileTask))
+    error = nil
+    begin
+      file("other" => "missing.txt")
+      @app.invoke("other")
+    rescue Picorake::Error => e
+      error = e
+    end
+    assert_equal("Don't know how to build task 'missing.txt'", error.message)
+  ensure
+    Picorake.file_stamper = nil
+  end
+
   def test_transitive_prerequisite_is_considered
     stamps["out"] = 100
     stamps["mid"] = 50

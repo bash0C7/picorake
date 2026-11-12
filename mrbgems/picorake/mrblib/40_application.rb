@@ -52,8 +52,15 @@ module Picorake
     end
 
     def [](task_name, scopes = nil)
-      lookup(task_name, scopes) or
+      lookup(task_name, scopes) || synthesize_file_task(task_name) or
         raise Error, "Don't know how to build task '#{task_name}'"
+    end
+
+    def synthesize_file_task(task_name)
+      source = Picorake.file_stamper
+      return nil unless source && source.call(task_name.to_s)
+
+      define_task(FileTask, task_name.to_s)
     end
 
     def tasks
