@@ -1,11 +1,20 @@
 module Picorake
+  def self.file_stamper
+    @file_stamper
+  end
+
+  def self.file_stamper=(callable)
+    @file_stamper = callable
+  end
+
   class FileTask < Task
     def self.scope_name(scope, task_name)
       task_name.to_s
     end
 
     def stamp(args = nil)
-      nil
+      source = Picorake.file_stamper
+      source && source.call(name)
     end
 
     def timestamp(args = nil)

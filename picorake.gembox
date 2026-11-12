@@ -1,0 +1,10 @@
+MRuby::GemBox.new do |conf|
+  root = File.dirname(MRuby::GemBox.path)
+  conf.gem gemdir: "#{MRUBY_ROOT}/mrbgems/mruby-file-stat"
+  conf.gem core: 'picoruby-env'
+  conf.gem core: 'picoruby-require'
+  conf.gem core: 'picoruby-time'
+  conf.gem gemdir: "#{root}/mrbgems/picorake"
+  conf.gem gemdir: "#{root}/mrbgems/picorake-spawn"
+  conf.gem gemdir: "#{root}/mrbgems/picorake-bin"
+end

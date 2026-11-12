@@ -19,7 +19,5 @@ MRuby::Build.new do |conf|
   conf.gem core: 'picoruby-bin-picoruby'
   conf.gem core: 'picoruby-picotest'
 
-  Dir.glob(File.expand_path("../mrbgems/*/mrbgem.rake", __dir__)).sort.each do |rake|
-    conf.gem gemdir: File.dirname(rake)
-  end
+  conf.gembox File.expand_path("../picorake", __dir__)
 end

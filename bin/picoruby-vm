@@ -22,7 +22,7 @@ mrbgems_hash() {
   done) | sha256_stdin
 }
 
-build_id() { printf '%s:%s:%s' "$SHA" "$(sha256_stdin < "$CONFIG")" "$(mrbgems_hash)"; }
+build_id() { printf '%s:%s:%s:%s' "$SHA" "$(sha256_stdin < "$CONFIG")" "$(sha256_stdin < "$ROOT/picorake.gembox")" "$(mrbgems_hash)"; }
 
 stale() {
   [ -f "$BINARY" ] || return 0

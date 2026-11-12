@@ -34,6 +34,8 @@ PicoRubyの上で動く、Rakefileの書式のtask定義と前提の解決。mrb
 | 並列(`multitask`、`-j`)を持たない | 今すぐ走らせる走り手を単純に保つ。並列は外の走り手(複数のworker)に任せる |
 | DSLを`Object`にprivateで`include`する | `load`で読んだfileの最上位のselfが、呼んだ側のselfと別のobjectになり、`extend`では届かない |
 | Rakefileが使えるgemは、VMに焼いたものだけ | PicoRubyに、実行時にgemを入れる仕組みが無い。純Rubyのfileは、翻訳器のある所なら実行時に`require`できる |
+| 前提に書いたfileは、`file`で宣言しないと見つからない | rakeは存在するfileのtaskを自動で作る。picorakeは持たない |
+| CLIは`load`のために相対pathをcwd基準の絶対pathに直す | PicoRubyの`load`は相対pathを`$LOAD_PATH`から探す |
 | `FileList`、`rule`、`import`、`directory`、`clean`、`rakelib/`の自動の読み込み、上のdirectoryへのRakefileの探索を持たない | 最初の約束を小さく保つ。要るものが出たら足す |
 
 ## 使い方
@@ -87,7 +89,7 @@ end
 | taskのclass | 「作る必要があるか」 | 時刻の取り方 |
 | --- | --- | --- |
 | `Task` | 常に作る | 今 |
-| `FileTask` | 無いか、前提の方が新しい | `File::Stat`の更新時刻(CLIのVMに`mruby-file-stat`を焼く) |
+| `FileTask` | 無いか、前提の方が新しい | `Picorake.file_stamper`が返す値。CLIは`File::Stat`の更新時刻(epoch秒)を置く(`mruby-file-stat`を焼く)。置かなければnil |
 | 使う側が足すclass | `FileTask`と同じ決まり | 使う側が決める(例: yommymonoはLocalStoreに置いた時刻) |
 
 ## jobとして走らせる
@@ -108,7 +110,7 @@ rakeと同じく、目標から前提を辿る。1回のclaimで1段だけ進め
 | 拡張のしかた | 例 |
 | --- | --- |
 | taskのclassを足す | `FileTask`の子で時刻の取り方を上書きし、`Picorake.define_task(klass, ...)`でDSLのmethodにする |
-| shellを差し替える | `Picorake.shell`へ`run(command)`を持つobjectを置く。既定は`IO.popen`でshellを通し、出力を1行ずつ流す |
+| `sh`の中身 | `sh "git", "fetch"`のargv形式だけを持つ。`Picorake::Spawn`でshellを通さずに起こし、出力を流す。1語の文字列に空白があれば`ArgumentError` |
 | 前提と動作を後から足す | `enhance` |
 | 走り手を足す | ライブラリの`plan`・`needed?`・`execute`を読む。登録は要らない |
 
@@ -119,6 +121,7 @@ rakeと同じく、目標から前提を辿る。1回のclaimで1段だけ進め
 - 芯のgem(`picorake`)は、PicoRubyの組み込みのclassだけに頼る。ファイル、IO、`ENV`に触らないので、ブラウザやマイコンのVMにもそのまま入る
 - CLIのgem(`picorake-bin`)が、`FileTask`の時刻、`sh`、`ENV`、`load`を持ち、それに要るgemに依存する
 - 配る`picorake`のCLIは、標準のgemの組を持つ。それ以上が要るprojectは、自分のVMのbuild構成に`picorake.gembox`と自分のgemを足して焼く
+- build構成からは`conf.gembox File.expand_path(".../picorake", __dir__)`で読む。`conf.gembox`は末尾に`.gembox`を足すので、拡張子は付けない
 - upstreamのPicoRubyの`picoruby-*`の名前は使わない
 
 ## repoの形
@@ -155,7 +158,6 @@ docs/plan.md
 
 ## 確かめていないこと
 
-- `mruby-file-stat`をホストのVMに焼けるか、`File::Stat#mtime`が取れるか
 - `conf.gem github:`で、repoの中の`mrbgems/`の下のgemを指せるか
 - Linux、Windows、R2P2、ブラウザで、外のRakefileを読めるか(build構成を読んだだけ)
 - ブラウザとマイコンのVMで、picotestを回す方法

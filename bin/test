@@ -6,6 +6,8 @@ if [ -z "${PICORUBY:-}" ]; then
   PICORUBY=$("$ROOT/bin/picoruby-vm" binary)
 fi
 export PICORUBY
+PICORAKE="$(dirname "$PICORUBY")/picorake"
+export PICORAKE
 cd "$ROOT"
 set -- mrbgems/picorake/mrblib/*.rb mrbgems/picorake-spawn/mrblib/*.rb
 trap '' PIPE
