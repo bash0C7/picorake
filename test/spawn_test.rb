@@ -510,6 +510,19 @@ class SpawnTest < Picotest::Test
     assert_equal(false, alive)
   end
 
+  def test_timeout_kills_grandchildren_in_the_process_group
+    dir = make_tmpdir
+    script = 'if (fork) { sleep 30 } else { open F, ">", $ARGV[0]; print F $$; close F; sleep 30 }'
+    error = timeout_error_of do
+      Picorake::Spawn.run(["/usr/bin/perl", "-e", script, "pid"], chdir: dir, timeout_ms: 500)
+    end
+    Picorake::Spawn.run(["/bin/sleep", "0.3"])
+    alive = child_alive?(dir)
+    remove_tmpdir(dir)
+    assert_equal(true, !error.nil?)
+    assert_equal(false, alive)
+  end
+
   def test_timeout_sigkills_a_child_that_ignores_sigterm
     dir = make_tmpdir
     error = nil

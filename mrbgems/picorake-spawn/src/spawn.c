@@ -221,11 +221,12 @@ reap(pid_t *pids, int started, int kill_first)
 }
 
 static void
-terminate_children(pid_t *pids, int count)
+terminate_children(pid_t *pids, int count, pid_t pgid)
 {
   long long start = now_ms();
   int i, alive;
 
+  if (pgid > 0) kill(-pgid, SIGTERM);
   for (i = 0; i < count; i++) kill(pids[i], SIGTERM);
   for (;;) {
     alive = 0;
@@ -237,10 +238,11 @@ terminate_children(pid_t *pids, int count)
       if (w == pids[i] || (w < 0 && errno != EINTR)) pids[i] = -1;
       else alive++;
     }
-    if (alive == 0) return;
+    if (alive == 0) break;
     if (now_ms() - start >= TERM_GRACE_MS) break;
     poll(NULL, 0, 5);
   }
+  if (pgid > 0) kill(-pgid, SIGKILL);
   for (i = 0; i < count; i++) {
     int st;
     if (pids[i] < 0) continue;
@@ -273,6 +275,7 @@ job_run(job_t *j)
   size_t cap = 0, len = 0, off = 0;
   short flags;
   long long start_ms = 0;
+  pid_t pgid = 0;
 
   j->fail_index = -1;
   j->fail_op = NULL;
@@ -335,7 +338,7 @@ job_run(job_t *j)
     sigemptyset(&mask);
     sigemptyset(&def);
     sigaddset(&def, SIGPIPE);
-    flags = POSIX_SPAWN_SETSIGMASK | POSIX_SPAWN_SETSIGDEF;
+    flags = POSIX_SPAWN_SETSIGMASK | POSIX_SPAWN_SETSIGDEF | POSIX_SPAWN_SETPGROUP;
 #if defined(POSIX_SPAWN_CLOEXEC_DEFAULT)
     flags |= POSIX_SPAWN_CLOEXEC_DEFAULT;
 #endif
@@ -350,6 +353,7 @@ job_run(job_t *j)
     posix_spawn_file_actions_t fa;
     if ((rc = posix_spawn_file_actions_init(&fa)) != 0) break;
     rc = build_actions(&fa, j, i, in_r, cap_w, links);
+    if (rc == 0) rc = posix_spawnattr_setpgroup(&attr, i == 0 ? 0 : pgid);
     if (rc == 0) rc = posix_spawnp(&pids[i], j->argvs[i][0], &fa, &attr, j->argvs[i], environ);
     posix_spawn_file_actions_destroy(&fa);
     if (rc != 0) {
@@ -357,6 +361,7 @@ job_run(job_t *j)
       break;
     }
     started++;
+    if (i == 0) pgid = pids[0];
     if (i == 0) close_fd(&in_r);
     if (i > 0) close_fd(&links[i - 1][0]);
     if (i < n - 1) close_fd(&links[i][1]);
@@ -503,7 +508,7 @@ cleanup:
     close_fd(&links[i][0]);
     close_fd(&links[i][1]);
   }
-  if (failed && j->timed_out) terminate_children(pids + first_unreaped, started - first_unreaped);
+  if (failed && j->timed_out) terminate_children(pids + first_unreaped, started - first_unreaped, pgid);
   else if (failed) reap(pids + first_unreaped, started - first_unreaped, 1);
   if (attr_ok) posix_spawnattr_destroy(&attr);
   if (chld_saved) sigaction(SIGCHLD, &old_chld, NULL);
