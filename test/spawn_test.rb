@@ -369,4 +369,232 @@ class SpawnTest < Picotest::Test
     assert_equal(0, status)
     assert_equal("0,1,2", output)
   end
+
+  def make_tmpdir
+    dir, status = Picorake::Spawn.run(["/usr/bin/mktemp", "-d"])
+    assert_equal(0, status)
+    dir.strip
+  end
+
+  def remove_tmpdir(dir)
+    Picorake::Spawn.run(["/bin/rm", "-rf", dir])
+  end
+
+  def elapsed_ms
+    started = Time.now.to_f
+    yield
+    ((Time.now.to_f - started) * 1000).to_i
+  end
+
+  def timeout_error_of
+    error = nil
+    begin
+      yield
+    rescue Picorake::Spawn::TimeoutError => e
+      error = e
+    end
+    error
+  end
+
+  def child_alive?(dir)
+    pid, _status = Picorake::Spawn.run(["/bin/cat", "pid"], chdir: dir)
+    _out, alive = Picorake::Spawn.run(["/bin/kill", "-0", pid.strip])
+    alive == 0
+  end
+
+  def pid_script(prefix)
+    prefix + 'open F, ">", "pid"; print F $$; close F; sleep 30'
+  end
+
+  def test_chdir_runs_the_child_in_that_directory
+    dir = make_tmpdir
+    here, _s = Picorake::Spawn.run(["/usr/bin/stat", "-f", "%i", dir])
+    there, status = Picorake::Spawn.run(["/usr/bin/stat", "-f", "%i", "."], chdir: dir)
+    remove_tmpdir(dir)
+    assert_equal(0, status)
+    assert_equal(here, there)
+  end
+
+  def test_chdir_pwd_resolves_to_the_directory
+    dir = make_tmpdir
+    printed, status = Picorake::Spawn.run(["/bin/pwd", "-P"], chdir: dir)
+    printed_inode, _s = Picorake::Spawn.run(["/usr/bin/stat", "-f", "%i", printed.strip])
+    dir_inode, _s = Picorake::Spawn.run(["/usr/bin/stat", "-f", "%i", dir])
+    remove_tmpdir(dir)
+    assert_equal(0, status)
+    assert_equal(true, printed.start_with?("/"))
+    assert_equal(dir_inode, printed_inode)
+  end
+
+  def test_chdir_applies_to_every_command_of_a_pipeline
+    dir = make_tmpdir
+    here, _s = Picorake::Spawn.run(["/usr/bin/stat", "-f", "%i", dir])
+    output, statuses = Picorake::Spawn.pipeline([["/usr/bin/stat", "-f", "%i", "."], ["/bin/cat"]], chdir: dir)
+    remove_tmpdir(dir)
+    assert_equal([0, 0], statuses)
+    assert_equal(here, output)
+  end
+
+  def test_chdir_applies_to_the_consumer_with_stdin_from
+    dir = make_tmpdir
+    here, _s = Picorake::Spawn.run(["/usr/bin/stat", "-f", "%i", dir])
+    output, status = Picorake::Spawn.run(["/usr/bin/stat", "-f", "%i", "."], stdin_from: [[[PRINTF, "%s", "x"]]], chdir: dir)
+    remove_tmpdir(dir)
+    assert_equal(0, status)
+    assert_equal(here, output)
+  end
+
+  def test_chdir_missing_directory_raises_error_and_starts_nothing
+    dir = make_tmpdir
+    missing = dir + "/no-such-dir"
+    trace = dir + "/trace"
+    error = nil
+    begin
+      Picorake::Spawn.run(["/usr/bin/touch", trace], chdir: missing)
+    rescue Picorake::Spawn::Error => e
+      error = e
+    end
+    _out, exists = Picorake::Spawn.run(["/bin/test", "-e", trace])
+    remove_tmpdir(dir)
+    assert_equal(true, !error.nil?)
+    assert_equal("/usr/bin/touch: chdir #{missing}: No such file or directory", error.message)
+    assert_equal(1, exists)
+  end
+
+  def test_chdir_to_a_file_raises_error
+    assert_raise(Picorake::Spawn::Error) { Picorake::Spawn.run(["/bin/cat"], chdir: "/etc/hosts") }
+  end
+
+  def test_chdir_missing_directory_raises_error_for_pipeline_and_stdin_from
+    assert_raise(Picorake::Spawn::Error) { Picorake::Spawn.pipeline([["/bin/cat"], ["/bin/cat"]], chdir: "/picorake/no/such/dir") }
+    assert_raise(Picorake::Spawn::Error) do
+      Picorake::Spawn.run(["/bin/cat"], stdin_from: [[[PRINTF, "%s", "x"]]], chdir: "/picorake/no/such/dir")
+    end
+  end
+
+  def test_invalid_chdir_raises_argument_error
+    assert_raise(ArgumentError) { Picorake::Spawn.run(["/bin/cat"], chdir: 1) }
+    assert_raise(ArgumentError) { Picorake::Spawn.run(["/bin/cat"], chdir: "/tmp\0x") }
+    assert_raise(ArgumentError) { Picorake::Spawn.pipeline([["/bin/cat"]], chdir: :tmp) }
+  end
+
+  def test_invalid_timeout_raises_argument_error
+    assert_raise(ArgumentError) { Picorake::Spawn.run(["/bin/cat"], timeout_ms: 0) }
+    assert_raise(ArgumentError) { Picorake::Spawn.run(["/bin/cat"], timeout_ms: -5) }
+    assert_raise(ArgumentError) { Picorake::Spawn.run(["/bin/cat"], timeout_ms: "100") }
+    assert_raise(ArgumentError) { Picorake::Spawn.run(["/bin/cat"], timeout_ms: 1.5) }
+    assert_raise(ArgumentError) { Picorake::Spawn.pipeline([["/bin/cat"]], timeout_ms: 0) }
+  end
+
+  def test_timeout_error_is_a_spawn_error
+    assert_equal(true, Picorake::Spawn::TimeoutError.ancestors.include?(Picorake::Spawn::Error))
+  end
+
+  def test_timeout_kills_a_long_running_child
+    error = nil
+    ms = elapsed_ms { error = timeout_error_of { Picorake::Spawn.run(["/bin/sleep", "5"], timeout_ms: 300) } }
+    assert_equal(true, !error.nil?)
+    assert_equal("/bin/sleep: timed out after 300 ms", error.message)
+    assert_equal(true, ms >= 250)
+    assert_equal(true, ms < 1500)
+  end
+
+  def test_timeout_leaves_no_child_behind
+    dir = make_tmpdir
+    error = timeout_error_of do
+      Picorake::Spawn.run(["/usr/bin/perl", "-e", pid_script("")], chdir: dir, timeout_ms: 500)
+    end
+    alive = child_alive?(dir)
+    remove_tmpdir(dir)
+    assert_equal(true, !error.nil?)
+    assert_equal(false, alive)
+  end
+
+  def test_timeout_sigkills_a_child_that_ignores_sigterm
+    dir = make_tmpdir
+    error = nil
+    ms = elapsed_ms do
+      error = timeout_error_of do
+        Picorake::Spawn.run(["/usr/bin/perl", "-e", pid_script('$SIG{TERM} = "IGNORE"; ')], chdir: dir, timeout_ms: 500)
+      end
+    end
+    alive = child_alive?(dir)
+    remove_tmpdir(dir)
+    assert_equal(true, !error.nil?)
+    assert_equal(false, alive)
+    assert_equal(true, ms >= 2400)
+    assert_equal(true, ms < 4000)
+  end
+
+  def test_timeout_not_reached_returns_normally
+    output, status = Picorake::Spawn.run([PRINTF, "%s", "fast"], timeout_ms: 5000)
+    assert_equal(0, status)
+    assert_equal("fast", output)
+    output, status = Picorake::Spawn.run(["/bin/cat"], stdin: "abc", timeout_ms: 5000)
+    assert_equal(0, status)
+    assert_equal("abc", output)
+  end
+
+  def test_timeout_with_stdin_large_input_returns_normally
+    data = "0123456789abcdef" * 80_000
+    output, status = Picorake::Spawn.run(["/bin/cat"], stdin: data, timeout_ms: 20_000)
+    assert_equal(0, status)
+    assert_equal(true, output == data)
+  end
+
+  def test_timeout_when_output_is_closed_but_the_child_keeps_running
+    error = nil
+    ms = elapsed_ms do
+      error = timeout_error_of do
+        Picorake::Spawn.run(["/usr/bin/perl", "-e", 'close STDOUT; close STDERR; sleep 30'], timeout_ms: 300)
+      end
+    end
+    assert_equal(true, !error.nil?)
+    assert_equal(true, ms < 1500)
+  end
+
+  def test_pipeline_timeout_kills_every_command
+    dir = make_tmpdir
+    error = nil
+    ms = elapsed_ms do
+      error = timeout_error_of do
+        Picorake::Spawn.pipeline([["/usr/bin/perl", "-e", pid_script("")], ["/bin/sleep", "5"]], chdir: dir, timeout_ms: 300)
+      end
+    end
+    alive = child_alive?(dir)
+    remove_tmpdir(dir)
+    assert_equal(true, !error.nil?)
+    assert_equal("/usr/bin/perl: timed out after 300 ms", error.message)
+    assert_equal(false, alive)
+    assert_equal(true, ms < 1500)
+  end
+
+  def test_pipeline_timeout_not_reached_returns_normally
+    output, statuses = Picorake::Spawn.pipeline([[PRINTF, "%s", "abc"], ["/usr/bin/tr", "a-z", "A-Z"]], timeout_ms: 5000)
+    assert_equal("ABC", output)
+    assert_equal([0, 0], statuses)
+  end
+
+  def test_out_inherit_with_timeout_raises
+    error = nil
+    ms = elapsed_ms { error = timeout_error_of { Picorake::Spawn.run(["/bin/sleep", "5"], out: :inherit, timeout_ms: 300) } }
+    assert_equal(true, !error.nil?)
+    assert_equal(true, ms < 1500)
+  end
+
+  def test_out_inherit_with_timeout_not_reached_returns_status
+    assert_equal(0, Picorake::Spawn.run(["/usr/bin/true"], out: :inherit, timeout_ms: 5000))
+    assert_equal(1, Picorake::Spawn.run(["/usr/bin/false"], out: :inherit, timeout_ms: 5000))
+  end
+
+  def test_stdin_from_consumer_honours_timeout
+    error = nil
+    ms = elapsed_ms do
+      error = timeout_error_of do
+        Picorake::Spawn.run(["/bin/sleep", "5"], stdin_from: [[[PRINTF, "%s", "x"]]], out: :inherit, timeout_ms: 300)
+      end
+    end
+    assert_equal(true, !error.nil?)
+    assert_equal(true, ms < 1500)
+  end
 end

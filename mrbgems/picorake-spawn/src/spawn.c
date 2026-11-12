@@ -2,13 +2,17 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <poll.h>
 #include <signal.h>
 #include <spawn.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/wait.h>
+#include <time.h>
 #include <unistd.h>
 
 #include <mruby.h>
@@ -28,6 +32,13 @@ extern char **environ;
 #define HAVE_ADDCLOSEFROM 1
 #endif
 
+#if defined(__APPLE__) || (defined(__GLIBC__) && (__GLIBC__ > 2 || (__GLIBC__ == 2 && __GLIBC_MINOR__ >= 29)))
+#define HAVE_ADDCHDIR 1
+#endif
+
+#define TERM_GRACE_MS 2000
+#define FAIL_BUF_SIZE (PATH_MAX + 16)
+
 typedef struct {
   char ***argvs;
   int n;
@@ -41,7 +52,19 @@ typedef struct {
   int *statuses;
   int fail_index;
   const char *fail_op;
+  const char *chdir_path;
+  long long timeout_ms;
+  int timed_out;
+  char fail_buf[FAIL_BUF_SIZE];
 } job_t;
+
+static long long
+now_ms(void)
+{
+  struct timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  return (long long)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
 
 static void
 wipe(void *p, size_t n)
@@ -140,6 +163,20 @@ build_actions(posix_spawn_file_actions_t *fa, const job_t *j, int i,
   int stdin_src = (i == 0) ? in_r : links[i - 1][0];
   int stdout_dst = last ? (j->capture ? cap_w : -1) : links[i][1];
 
+#if defined(HAVE_ADDCHDIR)
+  if (j->chdir_path) {
+#if defined(__APPLE__)
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+#endif
+    rc = posix_spawn_file_actions_addchdir_np(fa, j->chdir_path);
+#if defined(__APPLE__)
+#pragma clang diagnostic pop
+#endif
+    if (rc != 0) return rc;
+  }
+#endif
+
   switch (j->err_mode) {
   case ERR_MERGE:
     if ((rc = posix_spawn_file_actions_adddup2(fa, j->capture ? cap_w : 1, 2)) != 0) return rc;
@@ -183,6 +220,44 @@ reap(pid_t *pids, int started, int kill_first)
   }
 }
 
+static void
+terminate_children(pid_t *pids, int count)
+{
+  long long start = now_ms();
+  int i, alive;
+
+  for (i = 0; i < count; i++) kill(pids[i], SIGTERM);
+  for (;;) {
+    alive = 0;
+    for (i = 0; i < count; i++) {
+      int st;
+      pid_t w;
+      if (pids[i] < 0) continue;
+      w = waitpid(pids[i], &st, WNOHANG);
+      if (w == pids[i] || (w < 0 && errno != EINTR)) pids[i] = -1;
+      else alive++;
+    }
+    if (alive == 0) return;
+    if (now_ms() - start >= TERM_GRACE_MS) break;
+    poll(NULL, 0, 5);
+  }
+  for (i = 0; i < count; i++) {
+    int st;
+    if (pids[i] < 0) continue;
+    kill(pids[i], SIGKILL);
+    while (waitpid(pids[i], &st, 0) < 0 && errno == EINTR) {}
+  }
+}
+
+static int
+remaining_ms(const job_t *j, long long start)
+{
+  long long rem = j->timeout_ms - (now_ms() - start);
+  if (rem <= 0) return 0;
+  if (rem > INT_MAX) return INT_MAX;
+  return (int)rem;
+}
+
 static int
 job_run(job_t *j)
 {
@@ -197,11 +272,25 @@ job_run(job_t *j)
   char *buf = NULL;
   size_t cap = 0, len = 0, off = 0;
   short flags;
+  long long start_ms = 0;
 
   j->fail_index = -1;
   j->fail_op = NULL;
   j->out = NULL;
   j->out_len = 0;
+  j->timed_out = 0;
+
+  if (j->chdir_path) {
+    struct stat sb;
+    if (stat(j->chdir_path, &sb) < 0) rc = errno;
+    else if (!S_ISDIR(sb.st_mode)) rc = ENOTDIR;
+    if (rc != 0) {
+      j->fail_index = 0;
+      snprintf(j->fail_buf, sizeof(j->fail_buf), "chdir %s", j->chdir_path);
+      j->fail_op = j->fail_buf;
+      return rc;
+    }
+  }
 
   links = malloc(sizeof(int[2]) * (size_t)n);
   pids = malloc(sizeof(pid_t) * (size_t)n);
@@ -256,6 +345,7 @@ job_run(job_t *j)
     }
   }
 
+  start_ms = now_ms();
   for (i = 0; i < n && !rc; i++) {
     posix_spawn_file_actions_t fa;
     if ((rc = posix_spawn_file_actions_init(&fa)) != 0) break;
@@ -287,7 +377,7 @@ job_run(job_t *j)
 
   while (in_w >= 0 || cap_r >= 0) {
     struct pollfd p[2];
-    int nfds = 0, wi = -1, ri = -1, pr;
+    int nfds = 0, wi = -1, ri = -1, pr, pto;
 
     if (in_w >= 0) {
       p[nfds].fd = in_w;
@@ -301,7 +391,17 @@ job_run(job_t *j)
       p[nfds].revents = 0;
       ri = nfds++;
     }
-    pr = poll(p, (nfds_t)nfds, -1);
+    pto = -1;
+    if (j->timeout_ms > 0) {
+      pto = remaining_ms(j, start_ms);
+      if (pto == 0) {
+        j->timed_out = 1;
+        rc = ETIMEDOUT;
+        failed = 1;
+        goto cleanup;
+      }
+    }
+    pr = poll(p, (nfds_t)nfds, pto);
     if (pr < 0) {
       if (errno == EINTR) continue;
       rc = errno;
@@ -366,14 +466,26 @@ job_run(job_t *j)
   for (i = 0; i < n; i++) {
     int st = 0;
     first_unreaped = i;
-    while (waitpid(pids[i], &st, 0) < 0) {
-      if (errno != EINTR) {
+    for (;;) {
+      pid_t w = waitpid(pids[i], &st, j->timeout_ms > 0 ? WNOHANG : 0);
+      int rem;
+      if (w == pids[i]) break;
+      if (w < 0) {
+        if (errno == EINTR) continue;
         rc = errno;
         failed = 1;
         j->fail_index = i;
         j->fail_op = "waitpid";
         goto cleanup;
       }
+      rem = remaining_ms(j, start_ms);
+      if (rem == 0) {
+        j->timed_out = 1;
+        rc = ETIMEDOUT;
+        failed = 1;
+        goto cleanup;
+      }
+      poll(NULL, 0, rem < 5 ? rem : 5);
     }
     first_unreaped = i + 1;
     if (WIFEXITED(st)) j->statuses[i] = WEXITSTATUS(st);
@@ -391,7 +503,8 @@ cleanup:
     close_fd(&links[i][0]);
     close_fd(&links[i][1]);
   }
-  if (failed) reap(pids + first_unreaped, started - first_unreaped, 1);
+  if (failed && j->timed_out) terminate_children(pids + first_unreaped, started - first_unreaped);
+  else if (failed) reap(pids + first_unreaped, started - first_unreaped, 1);
   if (attr_ok) posix_spawnattr_destroy(&attr);
   if (chld_saved) sigaction(SIGCHLD, &old_chld, NULL);
   if (sig_saved) sigaction(SIGPIPE, &old, NULL);
@@ -476,6 +589,16 @@ raise_spawn_error(mrb_state *mrb, int rc, int fail_index, const char *op, mrb_va
   mrb_raisef(mrb, error_class, "%s", strerror(rc));
 }
 
+static void
+raise_timeout(mrb_state *mrb, long long timeout_ms, mrb_value argvs_v)
+{
+  struct RClass *spawn_mod = mrb_module_get_under(mrb, mrb_module_get(mrb, "Picorake"), "Spawn");
+  struct RClass *timeout_class = mrb_class_get_under(mrb, spawn_mod, "TimeoutError");
+  mrb_value cmd = mrb_ary_ref(mrb, mrb_ary_ref(mrb, argvs_v, 0), 0);
+
+  mrb_raisef(mrb, timeout_class, "%v: timed out after %v ms", cmd, mrb_fixnum_value((mrb_int)timeout_ms));
+}
+
 static mrb_value
 exec_result(mrb_state *mrb, job_t *job, int rc, mrb_value argvs_v)
 {
@@ -483,6 +606,11 @@ exec_result(mrb_state *mrb, job_t *job, int rc, mrb_value argvs_v)
   mrb_value result, statuses;
 
   if (rc != 0) {
+    if (job->timed_out) {
+      long long timeout_ms = job->timeout_ms;
+      free(job->statuses);
+      raise_timeout(mrb, timeout_ms, argvs_v);
+    }
     int fail_index = job->fail_index;
     const char *op = job->fail_op;
     free(job->statuses);
@@ -507,16 +635,30 @@ exec_result(mrb_state *mrb, job_t *job, int rc, mrb_value argvs_v)
   return result;
 }
 
+static void
+set_job_options(mrb_state *mrb, job_t *job, mrb_value chdir_v, mrb_int timeout_ms)
+{
+  if (!mrb_nil_p(chdir_v)) {
+    if (!mrb_string_p(chdir_v)) mrb_raise(mrb, E_ARGUMENT_ERROR, "chdir must be a String");
+#if !defined(HAVE_ADDCHDIR)
+    mrb_raise(mrb, E_NOTIMP_ERROR, "chdir is not supported on this platform");
+#endif
+    job->chdir_path = mrb_string_value_cstr(mrb, &chdir_v);
+  }
+  if (timeout_ms < 0) mrb_raise(mrb, E_ARGUMENT_ERROR, "timeout_ms must be positive");
+  job->timeout_ms = (long long)timeout_ms;
+}
+
 static mrb_value
 spawn_exec(mrb_state *mrb, mrb_value self)
 {
-  mrb_value argvs_v, stdin_v;
-  mrb_int err_mode, capture, n;
+  mrb_value argvs_v, stdin_v, chdir_v;
+  mrb_int err_mode, capture, n, timeout_ms;
   job_t job;
   char ***argvs;
   int rc;
 
-  mrb_get_args(mrb, "Aoii", &argvs_v, &stdin_v, &err_mode, &capture);
+  mrb_get_args(mrb, "Aoiioi", &argvs_v, &stdin_v, &err_mode, &capture, &chdir_v, &timeout_ms);
 
   n = RARRAY_LEN(argvs_v);
   if (n < 1) mrb_raise(mrb, E_ARGUMENT_ERROR, "argv must not be empty");
@@ -535,6 +677,7 @@ spawn_exec(mrb_state *mrb, mrb_value self)
   else {
     mrb_raise(mrb, E_ARGUMENT_ERROR, "stdin must be a String or nil");
   }
+  set_job_options(mrb, &job, chdir_v, timeout_ms);
 
   argvs = build_argvs(mrb, argvs_v);
   job.statuses = calloc((size_t)n, sizeof(int));
@@ -571,8 +714,8 @@ free_feeders(feeder_t *feeders, mrb_int nf)
 static mrb_value
 spawn_exec_feed(mrb_state *mrb, mrb_value self)
 {
-  mrb_value argvs_v, feeders_v, result;
-  mrb_int err_mode, capture, n, nf, i, k;
+  mrb_value argvs_v, feeders_v, chdir_v, result;
+  mrb_int err_mode, capture, n, nf, i, k, timeout_ms;
   job_t job;
   feeder_t *feeders;
   char ***argvs;
@@ -581,12 +724,14 @@ spawn_exec_feed(mrb_state *mrb, mrb_value self)
   int rc = 0, spawn_feeder = -1, spawn_index = -1, feed_index = -1, feed_stage = -1, feed_status = 0;
   const char *spawn_op = NULL;
 
-  mrb_get_args(mrb, "AAii", &argvs_v, &feeders_v, &err_mode, &capture);
+  mrb_get_args(mrb, "AAiioi", &argvs_v, &feeders_v, &err_mode, &capture, &chdir_v, &timeout_ms);
 
   n = RARRAY_LEN(argvs_v);
   nf = RARRAY_LEN(feeders_v);
   if (err_mode < ERR_MERGE || err_mode > ERR_INHERIT) mrb_raise(mrb, E_ARGUMENT_ERROR, "invalid err mode");
   validate_pipeline(mrb, argvs_v);
+  memset(&job, 0, sizeof(job));
+  set_job_options(mrb, &job, chdir_v, timeout_ms);
   for (i = 0; i < nf; i++) {
     mrb_value fv = mrb_ary_ref(mrb, feeders_v, i);
     if (!mrb_array_p(fv)) mrb_raise(mrb, E_ARGUMENT_ERROR, "stdin_from must be an Array of pipelines");
@@ -664,7 +809,6 @@ spawn_exec_feed(mrb_state *mrb, mrb_value self)
     return result;
   }
 
-  memset(&job, 0, sizeof(job));
   job.has_in = 1;
   job.in_data = buf;
   job.in_len = blen;
@@ -692,9 +836,10 @@ mrb_picorake_spawn_gem_init(mrb_state *mrb)
 {
   struct RClass *picorake = mrb_define_module(mrb, "Picorake");
   struct RClass *spawn = mrb_define_module_under(mrb, picorake, "Spawn");
-  mrb_define_class_under(mrb, spawn, "Error", E_STANDARD_ERROR);
-  mrb_define_module_function(mrb, spawn, "_exec", spawn_exec, MRB_ARGS_REQ(4));
-  mrb_define_module_function(mrb, spawn, "_exec_feed", spawn_exec_feed, MRB_ARGS_REQ(4));
+  struct RClass *error_class = mrb_define_class_under(mrb, spawn, "Error", E_STANDARD_ERROR);
+  mrb_define_class_under(mrb, spawn, "TimeoutError", error_class);
+  mrb_define_module_function(mrb, spawn, "_exec", spawn_exec, MRB_ARGS_REQ(6));
+  mrb_define_module_function(mrb, spawn, "_exec_feed", spawn_exec_feed, MRB_ARGS_REQ(6));
 }
 
 void
